@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 TDnet の日次開示一覧から「月次」開示(月次売上高・既存店売上高等)を見つけ、
-PDF中の表を解析して前年同月比(または増減率)が閾値を超える項目を Discord に通知する。
+PDF中の表を解析して前年同月比(または増減率)が +30pt 以上(プラスのみ)の項目を
+Discord に通知する。
 
 データソース: https://www.release.tdnet.info/inbs/I_list_001_YYYYMMDD.html
   (東京証券取引所 適時開示情報閲覧サービス。個別開示PDFへの直リンクを含む公開ページ)
@@ -37,7 +38,7 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
-THRESHOLD = 30.0  # 前年同月比 |value-100| >= 30 (または増減率 |value| >= 30) で通知
+THRESHOLD = 30.0  # 前年同月比 value-100 >= 30 (または増減率 value >= 30、プラスのみ) で通知
 
 STATE_PATH = Path(__file__).resolve().parent.parent / "state" / "notified.json"
 
@@ -183,7 +184,7 @@ def _extract_hits_from_one_table(table):
             continue
         sign, num = parsed
         delta = signed_delta(sign, num, label)
-        if abs(delta) >= THRESHOLD:
+        if delta >= THRESHOLD:
             hits.append(
                 {
                     "item": label,
@@ -259,7 +260,7 @@ def extract_hits_from_month_line_pairs(pdf_path: Path):
                     raw = values[idx]
                     month_label = months[idx]
                     delta = _pct_to_delta(raw.rstrip("%"), label)
-                    if abs(delta) >= THRESHOLD:
+                    if delta >= THRESHOLD:
                         hits.append(
                             {
                                 "item": f"{label}({month_label})",
@@ -285,7 +286,7 @@ def extract_hits_from_ratio_rows(pdf_path: Path):
                 if m:
                     label = m.group("label").strip()
                     delta = _pct_to_delta(m.group("pct"), "前年比")
-                    if abs(delta) >= THRESHOLD:
+                    if delta >= THRESHOLD:
                         hits.append(
                             {"item": label, "raw_value": m.group("pct") + "%", "delta": delta}
                         )
@@ -294,7 +295,7 @@ def extract_hits_from_ratio_rows(pdf_path: Path):
                 m2 = RATIO_ROW_NUMBERS_ONLY_RE.match(line)
                 if m2 and last_label_line and not HEADER_HINT_RE.search(last_label_line):
                     delta = _pct_to_delta(m2.group("pct"), "前年比")
-                    if abs(delta) >= THRESHOLD:
+                    if delta >= THRESHOLD:
                         hits.append(
                             {
                                 "item": last_label_line,
@@ -334,7 +335,7 @@ def extract_hits_from_text_fallback(pdf_path: Path):
                         delta = -num
                     else:
                         delta = _pct_to_delta((sign or "") + m.group("num"), "前年同月比")
-                    if abs(delta) >= THRESHOLD:
+                    if delta >= THRESHOLD:
                         hits.append(
                             {
                                 "item": line_n.strip()[:40],
@@ -408,11 +409,14 @@ def save_state(doc_ids: set):
     )
 
 
-def send_discord(webhook_url: str, results: list[ProcessResult]):
+def send_discord(webhook_url: str, results: list[ProcessResult], total_disclosures: int):
     all_hits = [h for r in results for h in r.hits]
     if not all_hits:
         return
-    lines = [f"**\U0001f4c8 月次データ前年同月比 {THRESHOLD:.0f}%超 検知 ({len(all_hits)}件)**"]
+    lines = [
+        f"**\U0001f4c8 月次データ前年同月比 +{THRESHOLD:.0f}pt以上 検知 ({len(all_hits)}件)**",
+        f"本日の月次関連開示: {total_disclosures}件",
+    ]
     by_company: dict[str, list[Hit]] = {}
     for h in all_hits:
         by_company.setdefault(f"{h.name}({h.code})", []).append(h)
@@ -488,7 +492,7 @@ def main():
     if not args.dry_run:
         webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
         if webhook_url and total_hits:
-            send_discord(webhook_url, results)
+            send_discord(webhook_url, results, len(disclosures))
         elif not webhook_url and total_hits:
             print("[WARN] DISCORD_WEBHOOK_URL not set, skipping notification", file=sys.stderr)
 
