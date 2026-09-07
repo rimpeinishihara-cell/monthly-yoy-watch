@@ -32,6 +32,11 @@ try:
 except ImportError:  # pragma: no cover
     pdfplumber = None
 
+try:
+    import anthropic
+except ImportError:  # pragma: no cover
+    anthropic = None
+
 JST = ZoneInfo("Asia/Tokyo")
 TDNET_BASE = "https://www.release.tdnet.info/inbs/"
 USER_AGENT = (
@@ -41,6 +46,134 @@ USER_AGENT = (
 THRESHOLD = 30.0  # 前年同月比 value-100 >= 30 (または増減率 value >= 30、プラスのみ) で通知
 
 STATE_PATH = Path(__file__).resolve().parent.parent / "state" / "notified.json"
+
+# Claude による判定(ヒューリスティック解析より優先。ANTHROPIC_API_KEY 未設定なら無効)
+CLAUDE_MODEL_DEFAULT = "claude-sonnet-5"
+CLAUDE_MAX_CALLS_DEFAULT = 40  # 1回の実行あたりの上限(MAX_CLAUDE_CALLS_PER_RUN で上書き可)
+
+CLAUDE_TOOL_SCHEMA = {
+    "name": "report_yoy_hits",
+    "description": (
+        "この月次開示PDFの中で、直近対象月の前年同月比(または増減率)が"
+        "+30pt/+30%以上のプラス項目を報告する。該当なしなら空配列。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "hits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "item": {
+                            "type": "string",
+                            "description": "項目名(例: 既存店売上高、全店売上高)",
+                        },
+                        "reported_value": {
+                            "type": "string",
+                            "description": "資料に記載されていた表記そのまま(例: 132.5%)",
+                        },
+                        "delta_pt": {
+                            "type": "number",
+                            "description": (
+                                "前年同月比の変化幅(pt)。100基準の比率なら value-100、"
+                                "増減率(0基準)ならその値そのもの。正の値のみ。"
+                            ),
+                        },
+                        "target_month": {
+                            "type": "string",
+                            "description": "対象月がわかれば(例: 2026年8月)",
+                        },
+                    },
+                    "required": ["item", "reported_value", "delta_pt"],
+                },
+            }
+        },
+        "required": ["hits"],
+    },
+}
+
+CLAUDE_PROMPT_TEMPLATE = """あなたは日本の上場企業が開示する「月次売上高」等のIR資料を読み、
+直近対象月の前年同月比(または増減率)が +30pt/+30% 以上のプラスの項目だけを正確に
+抽出するアシスタントです。
+
+重要な注意点:
+- 資料には、今回の対象月についての「前年同月比」の計算結果だけでなく、参考情報として
+  「前年(昨年)同月の実績そのものの数値」が並記されていることがあります。これは比較用の
+  過去の実績値であって前年同月比そのものではないので、絶対に前年同月比の変化量として
+  扱わないでください。
+- 複数月分の推移表がある場合は、一番新しい(直近の)対象月の値のみを対象にしてください。
+  過去の月の前年同月比は対象外です。
+- 比率(100基準、例: 130.5% → +30.5pt)か増減率(0基準、例: +30.5% → +30.5pt)かは、
+  見出しや単位表記など文脈から判断してください。
+- +30pt/+30%未満、またはマイナスの項目は報告しないでください。
+- 該当項目がなければ hits を空配列にしてください。
+- 数値の読み取りや、どの列が「今回の前年同月比」なのかに自信が持てない場合は、
+  無理に含めず除外してください(見逃しより誤検知の方が問題です)。
+
+企業名: {company_name}
+開示タイトル: {title}
+
+--- 以下、このPDFから抽出したテキストと表 ---
+{pdf_repr}
+--- ここまで ---
+
+report_yoy_hits ツールを使って結果を返してください。"""
+
+
+def build_pdf_representation(pdf_path: Path, max_chars: int = 20000) -> str:
+    """Claude に渡すための、PDFの全文テキスト+表構造の表現を作る。
+    自前の正規表現より前に、Claude自身に生のレイアウトを見て判断させるため
+    テキストと表の両方を渡す。
+    """
+    parts = []
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for p_idx, page in enumerate(pdf.pages, start=1):
+            text = (page.extract_text() or "").strip()
+            if text:
+                parts.append(f"[ページ{p_idx} テキスト]\n{text}")
+            for t_idx, table in enumerate(page.extract_tables() or [], start=1):
+                rows = [
+                    "\t".join(nfkc(str(c)) if c is not None else "" for c in row)
+                    for row in table
+                ]
+                if rows:
+                    parts.append(f"[ページ{p_idx} 表{t_idx}]\n" + "\n".join(rows))
+    repr_text = "\n\n".join(parts)
+    if len(repr_text) > max_chars:
+        repr_text = repr_text[:max_chars] + "\n...(以下省略)"
+    return repr_text
+
+
+def call_claude_judge(pdf_repr: str, company_name: str, title: str, model: str) -> list[dict]:
+    """Claude にPDF内容を渡し、+30pt以上のヒットを判定させる。
+    API呼び出し自体が失敗した場合は例外を送出する(呼び出し側でヒューリスティックに
+    フォールバックする)。
+    """
+    client = anthropic.Anthropic()
+    prompt = CLAUDE_PROMPT_TEMPLATE.format(
+        company_name=company_name, title=title, pdf_repr=pdf_repr
+    )
+    resp = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        tools=[CLAUDE_TOOL_SCHEMA],
+        tool_choice={"type": "tool", "name": "report_yoy_hits"},
+        messages=[{"role": "user", "content": prompt}],
+    )
+    for block in resp.content:
+        if block.type == "tool_use" and block.name == "report_yoy_hits":
+            out = []
+            for h in block.input.get("hits", []):
+                delta = float(h["delta_pt"])
+                if delta < THRESHOLD:
+                    continue
+                item = h["item"]
+                if h.get("target_month"):
+                    item = f"{item}({h['target_month']})"
+                out.append({"item": item, "raw_value": h["reported_value"], "delta": delta})
+            return out
+    return []
 
 ROW_RE = re.compile(
     r'kjCode"\s*noWrap>(?P<code>\d+)</td>\s*'
@@ -346,7 +479,7 @@ def extract_hits_from_text_fallback(pdf_path: Path):
     return hits
 
 
-def process_disclosure(item: dict, tmpdir: Path) -> ProcessResult:
+def process_disclosure(item: dict, tmpdir: Path, claude_ctx: dict | None = None) -> ProcessResult:
     result = ProcessResult(
         code=item["code"],
         name=item["name"],
@@ -362,13 +495,32 @@ def process_disclosure(item: dict, tmpdir: Path) -> ProcessResult:
         pdf_path = tmpdir / item["doc_id"]
         pdf_path.write_bytes(resp.content)
 
-        raw_hits = extract_hits_from_tables(pdf_path)
-        if not raw_hits:
-            raw_hits = extract_hits_from_month_line_pairs(pdf_path)
-        if not raw_hits:
-            raw_hits = extract_hits_from_ratio_rows(pdf_path)
-        if not raw_hits:
-            raw_hits = extract_hits_from_text_fallback(pdf_path)
+        raw_hits = None
+        if claude_ctx and claude_ctx["remaining"] > 0:
+            try:
+                pdf_repr = build_pdf_representation(pdf_path)
+                raw_hits = call_claude_judge(
+                    pdf_repr, item["name"], item["title"], claude_ctx["model"]
+                )
+                claude_ctx["used"] += 1
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[WARN] Claude判定に失敗、ヒューリスティックにフォールバック "
+                    f"({item['name']}): {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+                raw_hits = None
+            finally:
+                claude_ctx["remaining"] -= 1
+
+        if raw_hits is None:
+            raw_hits = extract_hits_from_tables(pdf_path)
+            if not raw_hits:
+                raw_hits = extract_hits_from_month_line_pairs(pdf_path)
+            if not raw_hits:
+                raw_hits = extract_hits_from_ratio_rows(pdf_path)
+            if not raw_hits:
+                raw_hits = extract_hits_from_text_fallback(pdf_path)
 
         # 同一項目・同一値の重複を除去
         seen = set()
@@ -465,6 +617,24 @@ def main():
         print("pdfplumber がインストールされていません", file=sys.stderr)
         sys.exit(1)
 
+    claude_ctx = None
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        if anthropic is None:
+            print(
+                "[WARN] ANTHROPIC_API_KEY が設定されていますが anthropic パッケージが"
+                "インストールされていません。ヒューリスティック解析のみで実行します。",
+                file=sys.stderr,
+            )
+        else:
+            # GitHub Actions は vars.XXX が未設定でも env に空文字列をセットするため
+            # .get(key, default) ではなく `or` で空文字列/未設定の両方を default に倒す
+            max_calls = int(os.environ.get("MAX_CLAUDE_CALLS_PER_RUN") or CLAUDE_MAX_CALLS_DEFAULT)
+            model = os.environ.get("ANTHROPIC_MODEL") or CLAUDE_MODEL_DEFAULT
+            claude_ctx = {"remaining": max_calls, "used": 0, "model": model}
+            print(f"[INFO] Claude判定 有効 (model={model}, 上限={max_calls}回/実行)")
+    else:
+        print("[INFO] ANTHROPIC_API_KEY 未設定のため、ヒューリスティック解析のみで実行します")
+
     print(f"[INFO] Checking TDnet disclosures for {target_date}")
     html = fetch_tdnet_list(target_date)
     disclosures = list(parse_monthly_disclosures(html))
@@ -480,7 +650,7 @@ def main():
     results = []
     for item in new_disclosures:
         print(f"[INFO] Processing {item['name']} - {item['title']}")
-        res = process_disclosure(item, tmpdir)
+        res = process_disclosure(item, tmpdir, claude_ctx)
         if res.error:
             print(f"[WARN] {item['name']}: {res.error}", file=sys.stderr)
         results.append(res)
@@ -488,6 +658,11 @@ def main():
 
     total_hits = sum(len(r.hits) for r in results)
     print(f"[INFO] Total hits: {total_hits}")
+    if claude_ctx:
+        print(
+            f"[INFO] Claude呼び出し回数: {claude_ctx['used']} "
+            f"(残り予算 {claude_ctx['remaining']})"
+        )
 
     if not args.dry_run:
         webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
