@@ -232,28 +232,59 @@ def nfkc(s: str) -> str:
 
 
 def fetch_tdnet_list(date: datetime.date) -> str:
-    url = f"{TDNET_BASE}I_list_001_{date:%Y%m%d}.html"
-    resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
-    resp.raise_for_status()
-    resp.encoding = "utf-8"
-    return resp.text
+    """TDnetの日次開示一覧を取得する。1ページ(I_list_001)に収まらないほど開示が
+    多い日は I_list_002, I_list_003... に分割される。以前はページ1しか見ておらず、
+    開示の多い日(例: 2026-09-07は全93件中2ページ目に46件、うち月次候補10件)を
+    大きく見落としていたため、404になるまで全ページ取得して連結する。
+    ページ1自体が空の日(土日祝)でも200が返るので、404はページ超過の合図として扱う。
+    """
+    pages = []
+    page_no = 1
+    while True:
+        url = f"{TDNET_BASE}I_list_{page_no:03d}_{date:%Y%m%d}.html"
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
+        if resp.status_code == 404:
+            break
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
+        pages.append(resp.text)
+        page_no += 1
+    return "\n".join(pages)
 
 
 TITLE_KEYWORDS = ("月次", "速報")
+# 「月次」「速報」を含まないが月次売上系と分かるタイトル
+# (例:「7月度の売上概況」「連結売上収益報告」「売上高推移報告」)を拾うための
+# 補助条件。「売上」「既存店」を含み、かつ具体的な月への言及(例: 7月, 8月度)が
+# あるものだけを対象にすることで、月に言及しない無関係な資料
+# (例:「売上高総利益率の収益性向上策について」)を誤って拾わないようにする。
+SALES_KEYWORDS = ("売上", "既存店")
+MONTH_REF_RE = re.compile(r"\d+月")
+
+
+def is_monthly_disclosure_title(title: str) -> bool:
+    if any(k in title for k in TITLE_KEYWORDS):
+        return True
+    return any(k in title for k in SALES_KEYWORDS) and bool(MONTH_REF_RE.search(title))
 
 
 def parse_monthly_disclosures(html: str):
+    seen_doc_ids = set()
     for m in ROW_RE.finditer(html):
+        href = m.group("href").strip()
+        if href in seen_doc_ids:
+            continue  # 複数ページ取得時の重複行対策
         title = nfkc(m.group("title"))
-        if not any(k in title for k in TITLE_KEYWORDS):
+        if not is_monthly_disclosure_title(title):
             continue
+        seen_doc_ids.add(href)
         yield {
             "code": nfkc(m.group("code")),
             "name": nfkc(m.group("name")),
             "title": title,
-            "href": m.group("href").strip(),
-            "pdf_url": TDNET_BASE + m.group("href").strip(),
-            "doc_id": m.group("href").strip(),
+            "href": href,
+            "pdf_url": TDNET_BASE + href,
+            "doc_id": href,
         }
 
 
@@ -595,7 +626,10 @@ def send_discord(
     ]
     by_company: dict[str, list[Hit]] = {}
     for h in all_hits:
-        by_company.setdefault(f"{h.name}({h.code})", []).append(h)
+        # TDnetのコードは5桁(末尾は株式種別等の1桁)なので、証券コードとして
+        # 馴染みのある4桁表示にする
+        display_code = h.code[:4] if len(h.code) == 5 else h.code
+        by_company.setdefault(f"{h.name}({display_code})", []).append(h)
     for company, hits in by_company.items():
         lines.append(f"\n**{company}**  {hits[0].title}")
         for h in hits:
