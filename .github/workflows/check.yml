@@ -1,9 +1,9 @@
 name: Monthly YoY Watch
 
+# GitHub Actions の schedule トリガーは実行が不安定(遅延・スキップ)なため、
+# 外部の cron-job.org から workflow_dispatch を毎日8:00 JSTに呼び出す運用にしている。
+# (README参照)
 on:
-  schedule:
-    # 毎日 21:30 JST (12:30 UTC) に実行。TDnetの当日開示が出揃う夕方以降を狙う。
-    - cron: "30 12 * * *"
   workflow_dispatch:
     inputs:
       date:

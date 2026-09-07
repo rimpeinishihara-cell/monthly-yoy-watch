@@ -5,7 +5,8 @@
 
 ## 仕組み
 
-1. 毎日 GitHub Actions(cron)が起動
+1. 毎日 [cron-job.org](https://cron-job.org) から GitHub Actions の `workflow_dispatch` API を叩いて起動
+   (GitHub Actions 自体の `schedule` トリガーは実行遅延・スキップが多く不安定なため使用していない)
 2. `https://www.release.tdnet.info/inbs/I_list_001_YYYYMMDD.html` からその日の適時開示一覧を取得
 3. タイトルに「月次」または「速報」を含む開示を抽出
 4. 各PDFをダウンロードし、以下の順で表・数値を解析
@@ -36,6 +37,38 @@ python scripts/check_monthly.py --date 2026-09-04 --dry-run  # ローカルで�
 ```
 
 GitHub リポジトリの Secrets に `DISCORD_WEBHOOK_URL` を設定すると、GitHub Actions から自動投稿されます。
+
+### cron-job.org での毎日実行設定
+
+GitHub Actions の `schedule` は不安定なため、外部の cron-job.org から `workflow_dispatch` を
+API経由で毎日8:00 JSTに叩く運用にしている。設定手順:
+
+1. **GitHubのfine-grained personal access tokenを発行**
+   - https://github.com/settings/personal-access-tokens/new を開く
+   - Repository access: "Only select repositories" → `monthly-yoy-watch` を選択
+   - Permissions → Repository permissions → **Actions: Read and write** を設定
+   - 有効期限は任意(90日〜1年など)で発行し、トークン文字列(`github_pat_...`)をコピー
+
+2. **cron-job.org でジョブを作成**
+   - https://cron-job.org にログイン(アカウントがなければ作成)
+   - 「CREATE CRONJOB」→ 以下を設定
+     - **Title**: `monthly-yoy-watch daily trigger`
+     - **URL**: `https://api.github.com/repos/rimpeinishihara-cell/monthly-yoy-watch/actions/workflows/check.yml/dispatches`
+     - **Request method**: `POST`
+     - **Schedule**: 毎日 08:00, タイムゾーン `Asia/Tokyo`
+     - **Headers** (Advanced → Headers) に以下を追加:
+       - `Accept: application/vnd.github+json`
+       - `Authorization: Bearer <上で発行したトークン>`
+       - `X-GitHub-Api-Version: 2022-11-28`
+       - `Content-Type: application/json`
+     - **Request body** (Advanced → Body):
+       ```json
+       {"ref":"master"}
+       ```
+   - 保存すると、毎日8:00にこのジョブがGitHub APIを叩き、Actionsの `Monthly YoY Watch` ワークフローが起動する
+
+3. 動作確認は cron-job.org の「Execute now」、または GitHub 側で
+   `Actions` タブ → `Monthly YoY Watch` → `Run workflow` から手動実行できる。
 
 ## 既知の制限
 
