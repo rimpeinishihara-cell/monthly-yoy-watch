@@ -145,10 +145,29 @@ def build_pdf_representation(pdf_path: Path, max_chars: int = 20000) -> str:
     return repr_text
 
 
-def call_claude_judge(pdf_repr: str, company_name: str, title: str, model: str) -> list[dict]:
+# $/1Mトークン (入力, 出力)。未掲載モデルはコスト表示を省略しトークン数のみ出す。
+CLAUDE_PRICING_PER_MTOK = {
+    "claude-haiku-4-5-20251001": (1.00, 5.00),
+    "claude-haiku-4-5": (1.00, 5.00),
+    "claude-sonnet-5": (2.00, 10.00),
+    "claude-opus-5": (5.00, 25.00),
+}
+
+
+def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    pricing = CLAUDE_PRICING_PER_MTOK.get(model)
+    if pricing is None:
+        return None
+    price_in, price_out = pricing
+    return input_tokens / 1_000_000 * price_in + output_tokens / 1_000_000 * price_out
+
+
+def call_claude_judge(
+    pdf_repr: str, company_name: str, title: str, model: str
+) -> tuple[list[dict], dict]:
     """Claude にPDF内容を渡し、+30pt以上のヒットを判定させる。
     API呼び出し自体が失敗した場合は例外を送出する(呼び出し側でヒューリスティックに
-    フォールバックする)。
+    フォールバックする)。戻り値は (hits, usage) で usage は {"input_tokens", "output_tokens"}。
     """
     client = anthropic.Anthropic()
     prompt = CLAUDE_PROMPT_TEMPLATE.format(
@@ -161,6 +180,10 @@ def call_claude_judge(pdf_repr: str, company_name: str, title: str, model: str) 
         tool_choice={"type": "tool", "name": "report_yoy_hits"},
         messages=[{"role": "user", "content": prompt}],
     )
+    usage = {
+        "input_tokens": resp.usage.input_tokens,
+        "output_tokens": resp.usage.output_tokens,
+    }
     for block in resp.content:
         if block.type == "tool_use" and block.name == "report_yoy_hits":
             out = []
@@ -172,8 +195,8 @@ def call_claude_judge(pdf_repr: str, company_name: str, title: str, model: str) 
                 if h.get("target_month"):
                     item = f"{item}({h['target_month']})"
                 out.append({"item": item, "raw_value": h["reported_value"], "delta": delta})
-            return out
-    return []
+            return out, usage
+    return [], usage
 
 ROW_RE = re.compile(
     r'kjCode"\s*noWrap>(?P<code>\d+)</td>\s*'
@@ -499,10 +522,12 @@ def process_disclosure(item: dict, tmpdir: Path, claude_ctx: dict | None = None)
         if claude_ctx and claude_ctx["remaining"] > 0:
             try:
                 pdf_repr = build_pdf_representation(pdf_path)
-                raw_hits = call_claude_judge(
+                raw_hits, usage = call_claude_judge(
                     pdf_repr, item["name"], item["title"], claude_ctx["model"]
                 )
                 claude_ctx["used"] += 1
+                claude_ctx["input_tokens"] += usage["input_tokens"]
+                claude_ctx["output_tokens"] += usage["output_tokens"]
             except Exception as e:  # noqa: BLE001
                 print(
                     f"[WARN] Claude判定に失敗、ヒューリスティックにフォールバック "
@@ -561,7 +586,12 @@ def save_state(doc_ids: set):
     )
 
 
-def send_discord(webhook_url: str, results: list[ProcessResult], total_disclosures: int):
+def send_discord(
+    webhook_url: str,
+    results: list[ProcessResult],
+    total_disclosures: int,
+    claude_ctx: dict | None = None,
+):
     all_hits = [h for r in results for h in r.hits]
     if not all_hits:
         return
@@ -578,6 +608,16 @@ def send_discord(webhook_url: str, results: list[ProcessResult], total_disclosur
             sign = "+" if h.delta >= 0 else ""
             lines.append(f"・{h.item}: {h.raw_value} ({sign}{h.delta:.1f}pt)")
         lines.append(f"<{hits[0].pdf_url}>")
+
+    if claude_ctx and claude_ctx["used"] > 0:
+        cost = estimate_cost_usd(
+            claude_ctx["model"], claude_ctx["input_tokens"], claude_ctx["output_tokens"]
+        )
+        cost_str = f"約${cost:.4f}" if cost is not None else "不明"
+        lines.append(
+            f"\n\U0001f4b0 本日のClaude判定コスト: {cost_str}"
+            f" ({claude_ctx['model']}, {claude_ctx['used']}件判定)"
+        )
 
     content = "\n".join(lines)
     # Discord の1メッセージ2000文字制限に合わせて分割
@@ -630,7 +670,13 @@ def main():
             # .get(key, default) ではなく `or` で空文字列/未設定の両方を default に倒す
             max_calls = int(os.environ.get("MAX_CLAUDE_CALLS_PER_RUN") or CLAUDE_MAX_CALLS_DEFAULT)
             model = os.environ.get("ANTHROPIC_MODEL") or CLAUDE_MODEL_DEFAULT
-            claude_ctx = {"remaining": max_calls, "used": 0, "model": model}
+            claude_ctx = {
+                "remaining": max_calls,
+                "used": 0,
+                "model": model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            }
             print(f"[INFO] Claude判定 有効 (model={model}, 上限={max_calls}回/実行)")
     else:
         print("[INFO] ANTHROPIC_API_KEY 未設定のため、ヒューリスティック解析のみで実行します")
@@ -659,15 +705,20 @@ def main():
     total_hits = sum(len(r.hits) for r in results)
     print(f"[INFO] Total hits: {total_hits}")
     if claude_ctx:
+        cost = estimate_cost_usd(
+            claude_ctx["model"], claude_ctx["input_tokens"], claude_ctx["output_tokens"]
+        )
+        cost_str = f"${cost:.4f}" if cost is not None else "不明(料金表未登録モデル)"
         print(
-            f"[INFO] Claude呼び出し回数: {claude_ctx['used']} "
-            f"(残り予算 {claude_ctx['remaining']})"
+            f"[INFO] Claude呼び出し回数: {claude_ctx['used']} (残り予算 {claude_ctx['remaining']}), "
+            f"概算コスト: {cost_str} "
+            f"(input={claude_ctx['input_tokens']}, output={claude_ctx['output_tokens']} tokens)"
         )
 
     if not args.dry_run:
         webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
         if webhook_url and total_hits:
-            send_discord(webhook_url, results, len(disclosures))
+            send_discord(webhook_url, results, len(disclosures), claude_ctx)
         elif not webhook_url and total_hits:
             print("[WARN] DISCORD_WEBHOOK_URL not set, skipping notification", file=sys.stderr)
 
