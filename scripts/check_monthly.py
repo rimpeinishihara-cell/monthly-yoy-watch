@@ -15,6 +15,7 @@ Discord に通知する。
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import json
 import os
@@ -114,35 +115,7 @@ CLAUDE_PROMPT_TEMPLATE = """あなたは日本の上場企業が開示する「�
 企業名: {company_name}
 開示タイトル: {title}
 
---- 以下、このPDFから抽出したテキストと表 ---
-{pdf_repr}
---- ここまで ---
-
-report_yoy_hits ツールを使って結果を返してください。"""
-
-
-def build_pdf_representation(pdf_path: Path, max_chars: int = 20000) -> str:
-    """Claude に渡すための、PDFの全文テキスト+表構造の表現を作る。
-    自前の正規表現より前に、Claude自身に生のレイアウトを見て判断させるため
-    テキストと表の両方を渡す。
-    """
-    parts = []
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        for p_idx, page in enumerate(pdf.pages, start=1):
-            text = (page.extract_text() or "").strip()
-            if text:
-                parts.append(f"[ページ{p_idx} テキスト]\n{text}")
-            for t_idx, table in enumerate(page.extract_tables() or [], start=1):
-                rows = [
-                    "\t".join(nfkc(str(c)) if c is not None else "" for c in row)
-                    for row in table
-                ]
-                if rows:
-                    parts.append(f"[ページ{p_idx} 表{t_idx}]\n" + "\n".join(rows))
-    repr_text = "\n\n".join(parts)
-    if len(repr_text) > max_chars:
-        repr_text = repr_text[:max_chars] + "\n...(以下省略)"
-    return repr_text
+添付のPDFを見て、report_yoy_hits ツールを使って結果を返してください。"""
 
 
 # $/1Mトークン (入力, 出力)。未掲載モデルはコスト表示を省略しトークン数のみ出す。
@@ -163,22 +136,40 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
 
 
 def call_claude_judge(
-    pdf_repr: str, company_name: str, title: str, model: str
+    pdf_path: Path, company_name: str, title: str, model: str
 ) -> tuple[list[dict], dict]:
-    """Claude にPDF内容を渡し、+30pt以上のヒットを判定させる。
+    """Claude にPDFファイル自体を渡し、+30pt以上のヒットを判定させる。
+    pdfplumberでのテキスト/表抽出は、罫線なし・変則レイアウトのPDFで文字が
+    バラバラに壊れることがあり(実例: 大光のPDFで数字が一文字ずつ分解され、
+    Claudeが意味不明な文字列から誤ったヒットを生成した)、Claude自身のネイティブな
+    PDF読解に任せる方が信頼できるため、抽出テキストではなくPDFを直接送る。
     API呼び出し自体が失敗した場合は例外を送出する(呼び出し側でヒューリスティックに
     フォールバックする)。戻り値は (hits, usage) で usage は {"input_tokens", "output_tokens"}。
     """
     client = anthropic.Anthropic()
-    prompt = CLAUDE_PROMPT_TEMPLATE.format(
-        company_name=company_name, title=title, pdf_repr=pdf_repr
-    )
+    prompt = CLAUDE_PROMPT_TEMPLATE.format(company_name=company_name, title=title)
+    pdf_b64 = base64.standard_b64encode(pdf_path.read_bytes()).decode("utf-8")
     resp = client.messages.create(
         model=model,
         max_tokens=1024,
         tools=[CLAUDE_TOOL_SCHEMA],
         tool_choice={"type": "tool", "name": "report_yoy_hits"},
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_b64,
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
     )
     usage = {
         "input_tokens": resp.usage.input_tokens,
@@ -521,9 +512,8 @@ def process_disclosure(item: dict, tmpdir: Path, claude_ctx: dict | None = None)
         raw_hits = None
         if claude_ctx and claude_ctx["remaining"] > 0:
             try:
-                pdf_repr = build_pdf_representation(pdf_path)
                 raw_hits, usage = call_claude_judge(
-                    pdf_repr, item["name"], item["title"], claude_ctx["model"]
+                    pdf_path, item["name"], item["title"], claude_ctx["model"]
                 )
                 claude_ctx["used"] += 1
                 claude_ctx["input_tokens"] += usage["input_tokens"]
