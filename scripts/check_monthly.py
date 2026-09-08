@@ -642,24 +642,28 @@ def send_discord(
     jpy_rate: float | None = None,
 ):
     all_hits = [h for r in results for h in r.hits]
-    if not all_hits:
-        return
-    lines = [
-        f"**\U0001f4c8 月次データ前年同月比 +{THRESHOLD:.0f}pt以上 検知 ({len(all_hits)}件)**",
-        f"本日の月次関連開示: {total_disclosures}件",
-    ]
-    by_company: dict[str, list[Hit]] = {}
-    for h in all_hits:
-        # TDnetのコードは5桁(末尾は株式種別等の1桁)なので、証券コードとして
-        # 馴染みのある4桁表示にする
-        display_code = h.code[:4] if len(h.code) == 5 else h.code
-        by_company.setdefault(f"{h.name}({display_code})", []).append(h)
-    for company, hits in by_company.items():
-        lines.append(f"\n**{company}**  {hits[0].title}")
-        for h in hits:
-            sign = "+" if h.delta >= 0 else ""
-            lines.append(f"・{h.item}: {h.raw_value} ({sign}{h.delta:.1f}pt)")
-        lines.append(f"<{hits[0].pdf_url}>")
+    if all_hits:
+        lines = [
+            f"**\U0001f4c8 月次データ前年同月比 +{THRESHOLD:.0f}pt以上 検知 ({len(all_hits)}件)**",
+            f"本日の月次関連開示: {total_disclosures}件",
+        ]
+        by_company: dict[str, list[Hit]] = {}
+        for h in all_hits:
+            # TDnetのコードは5桁(末尾は株式種別等の1桁)なので、証券コードとして
+            # 馴染みのある4桁表示にする
+            display_code = h.code[:4] if len(h.code) == 5 else h.code
+            by_company.setdefault(f"{h.name}({display_code})", []).append(h)
+        for company, hits in by_company.items():
+            lines.append(f"\n**{company}**  {hits[0].title}")
+            for h in hits:
+                sign = "+" if h.delta >= 0 else ""
+                lines.append(f"・{h.item}: {h.raw_value} ({sign}{h.delta:.1f}pt)")
+            lines.append(f"<{hits[0].pdf_url}>")
+    else:
+        lines = [
+            f"**✅ 月次データ確認完了 - +{THRESHOLD:.0f}pt以上の該当なし**",
+            f"本日の月次関連開示: {total_disclosures}件(処理: {len(results)}件)",
+        ]
 
     if claude_ctx and claude_ctx["used"] > 0:
         cost = estimate_cost_usd(
@@ -770,9 +774,10 @@ def main():
 
     if not args.dry_run:
         webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
-        if webhook_url and total_hits:
+        if webhook_url:
+            # ヒット0件でも「該当なし」+コストを通知する
             send_discord(webhook_url, results, len(disclosures), claude_ctx, jpy_rate)
-        elif not webhook_url and total_hits:
+        else:
             print("[WARN] DISCORD_WEBHOOK_URL not set, skipping notification", file=sys.stderr)
 
     save_state(state)
