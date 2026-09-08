@@ -638,14 +638,16 @@ def send_discord(
     webhook_url: str,
     results: list[ProcessResult],
     total_disclosures: int,
+    target_date: datetime.date,
     claude_ctx: dict | None = None,
     jpy_rate: float | None = None,
 ):
+    date_str = f"{target_date.month}/{target_date.day}"
     all_hits = [h for r in results for h in r.hits]
     if all_hits:
         lines = [
-            f"**\U0001f4c8 月次データ前年同月比 +{THRESHOLD:.0f}pt以上 検知 ({len(all_hits)}件)**",
-            f"本日の月次関連開示: {total_disclosures}件",
+            f"**\U0001f4c8 月次データ前年同月比 +{THRESHOLD:.0f}pt以上 検知 ({date_str}, {len(all_hits)}件)**",
+            f"{date_str}の月次関連開示: {total_disclosures}件",
         ]
         by_company: dict[str, list[Hit]] = {}
         for h in all_hits:
@@ -661,8 +663,8 @@ def send_discord(
             lines.append(f"<{hits[0].pdf_url}>")
     else:
         lines = [
-            f"**✅ 月次データ確認完了 - +{THRESHOLD:.0f}pt以上の該当なし**",
-            f"本日の月次関連開示: {total_disclosures}件(処理: {len(results)}件)",
+            f"**✅ 月次データ確認完了({date_str}) - +{THRESHOLD:.0f}pt以上の該当なし**",
+            f"{date_str}の月次関連開示: {total_disclosures}件(処理: {len(results)}件)",
         ]
 
     if claude_ctx and claude_ctx["used"] > 0:
@@ -670,7 +672,7 @@ def send_discord(
             claude_ctx["model"], claude_ctx["input_tokens"], claude_ctx["output_tokens"]
         )
         lines.append(
-            f"\n\U0001f4b0 本日のClaude判定コスト: 約{format_cost(cost, jpy_rate)}"
+            f"\n\U0001f4b0 {date_str}のClaude判定コスト: 約{format_cost(cost, jpy_rate)}"
             f" ({claude_ctx['model']}, {claude_ctx['used']}件判定)"
         )
 
@@ -776,7 +778,7 @@ def main():
         webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
         if webhook_url:
             # ヒット0件でも「該当なし」+コストを通知する
-            send_discord(webhook_url, results, len(disclosures), claude_ctx, jpy_rate)
+            send_discord(webhook_url, results, len(disclosures), target_date, claude_ctx, jpy_rate)
         else:
             print("[WARN] DISCORD_WEBHOOK_URL not set, skipping notification", file=sys.stderr)
 
