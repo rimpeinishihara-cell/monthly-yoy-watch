@@ -139,6 +139,29 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
     return input_tokens / 1_000_000 * price_in + output_tokens / 1_000_000 * price_out
 
 
+def fetch_usd_jpy_rate() -> float | None:
+    """コスト表示を円換算するための為替レートを取得する。取得に失敗しても
+    本筋の処理には影響しないため、Noneを返してドル表記のみにフォールバックする。
+    """
+    try:
+        resp = requests.get(
+            "https://api.frankfurter.app/latest?from=USD&to=JPY", timeout=10
+        )
+        resp.raise_for_status()
+        return float(resp.json()["rates"]["JPY"])
+    except Exception:
+        return None
+
+
+def format_cost(cost_usd: float | None, jpy_rate: float | None) -> str:
+    if cost_usd is None:
+        return "不明(料金表未登録モデル)"
+    s = f"${cost_usd:.4f}"
+    if jpy_rate is not None:
+        s += f"(約{cost_usd * jpy_rate:,.1f}円)"
+    return s
+
+
 def call_claude_judge(
     pdf_path: Path, company_name: str, title: str, model: str
 ) -> tuple[list[dict], dict]:
@@ -616,6 +639,7 @@ def send_discord(
     results: list[ProcessResult],
     total_disclosures: int,
     claude_ctx: dict | None = None,
+    jpy_rate: float | None = None,
 ):
     all_hits = [h for r in results for h in r.hits]
     if not all_hits:
@@ -641,9 +665,8 @@ def send_discord(
         cost = estimate_cost_usd(
             claude_ctx["model"], claude_ctx["input_tokens"], claude_ctx["output_tokens"]
         )
-        cost_str = f"約${cost:.4f}" if cost is not None else "不明"
         lines.append(
-            f"\n\U0001f4b0 本日のClaude判定コスト: {cost_str}"
+            f"\n\U0001f4b0 本日のClaude判定コスト: 約{format_cost(cost, jpy_rate)}"
             f" ({claude_ctx['model']}, {claude_ctx['used']}件判定)"
         )
 
@@ -732,21 +755,23 @@ def main():
 
     total_hits = sum(len(r.hits) for r in results)
     print(f"[INFO] Total hits: {total_hits}")
+    jpy_rate = None
     if claude_ctx:
         cost = estimate_cost_usd(
             claude_ctx["model"], claude_ctx["input_tokens"], claude_ctx["output_tokens"]
         )
-        cost_str = f"${cost:.4f}" if cost is not None else "不明(料金表未登録モデル)"
+        if claude_ctx["used"] > 0:
+            jpy_rate = fetch_usd_jpy_rate()
         print(
             f"[INFO] Claude呼び出し回数: {claude_ctx['used']} (残り予算 {claude_ctx['remaining']}), "
-            f"概算コスト: {cost_str} "
+            f"概算コスト: {format_cost(cost, jpy_rate)} "
             f"(input={claude_ctx['input_tokens']}, output={claude_ctx['output_tokens']} tokens)"
         )
 
     if not args.dry_run:
         webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
         if webhook_url and total_hits:
-            send_discord(webhook_url, results, len(disclosures), claude_ctx)
+            send_discord(webhook_url, results, len(disclosures), claude_ctx, jpy_rate)
         elif not webhook_url and total_hits:
             print("[WARN] DISCORD_WEBHOOK_URL not set, skipping notification", file=sys.stderr)
 
