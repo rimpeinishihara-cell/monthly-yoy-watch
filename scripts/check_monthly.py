@@ -720,8 +720,8 @@ def make_gemini_ctx(api_key: str, models_csv: str, rpm: int) -> dict:
 
 
 def judge_with_gemini(pdf_path: Path, item: dict, ctx: dict) -> list[dict] | None:
-    """使えるGeminiモデルを優先順に試す。判定できたらhits、Gemini全体が使えない/この1件が
-    失敗したらNone(呼び出し側がClaudeへ)。無料枠が尽きたモデルは以降スキップする。"""
+    """使えるGeminiモデルを優先順に試す(上限到達・503等の失敗時は次のモデルへ)。判定できたら
+    hits、全モデルで判定できなかったらNone(呼び出し側がClaudeへ)。無料枠が尽きたモデルは以降スキップ。"""
     for m in ctx["models"]:
         if m["disabled"]:
             continue
@@ -747,18 +747,21 @@ def judge_with_gemini(pdf_path: Path, item: dict, ctx: dict) -> list[dict] | Non
                 ctx["disabled"] = True
                 ctx["disabled_reason"] = "連続エラー"
             print(
-                f"[WARN] Gemini判定に失敗、Claudeにフォールバック ({item['name']}): "
+                f"[WARN] Gemini {m['name']} の判定に失敗 ({item['name']}): "
                 f"{type(e).__name__}: {e}",
                 file=sys.stderr,
             )
-            return None
+            if ctx["disabled"]:
+                return None
+            continue  # 混雑(503)などはモデルごとに状況が違うので、次のモデルを試す
         ctx["used"] += 1
         m["used"] += 1
         ctx["consecutive_failures"] = 0
         ctx["input_tokens"] += usage["input_tokens"]
         ctx["output_tokens"] += usage["output_tokens"]
         return hits
-    ctx["disabled"] = True
+    if all(m["disabled"] for m in ctx["models"]):
+        ctx["disabled"] = True
     return None
 
 
