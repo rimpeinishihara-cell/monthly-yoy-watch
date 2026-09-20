@@ -15,7 +15,12 @@
    言及(例: 「7月度」「8月の」)がある開示も抽出する(「月次」「速報」という単語を
    使わずに月次売上を報告する開示があるため。例:「○月度の売上概況」「連結売上収益報告」)
 4. 各PDFをダウンロードし、以下のいずれかで解析
-   - **Claude判定(`ANTHROPIC_API_KEY` 設定時、優先)**: PDFファイルそのものをClaudeに渡し、
+   - **判定の優先順位**: ① Gemini(`GEMINI_API_KEY` 設定時。無料枠) → ② Claude(`ANTHROPIC_API_KEY`
+     設定時。有料) → ③ ヒューリスティック解析。Geminiの無料枠(429 RESOURCE_EXHAUSTED)の
+     上限に達したら、その実行の残りはClaudeに切り替わる(分あたり上限は待って再試行、
+     日次上限は即切り替え。認証エラー等はGeminiを停止しClaudeへ)。Discord通知にはどちらで
+     何件判定したかと概算コストを表示する。各開示のActionsログに `判定: gemini/claude/heuristic` が出る。
+   - **Claude判定(`ANTHROPIC_API_KEY` 設定時)**: PDFファイルそのものをClaudeに渡し、
      「直近対象月の前年同月比・増減率」だけを判定させる。参考掲載されている前年実績値そのもの
      (前年同月比の計算結果ではない、単なる過去の数値)を誤って変化率として拾わないよう、
      プロンプトで明示的に除外を指示している。複数事業グループ・複数ページにまたがる開示は
@@ -54,6 +59,17 @@ python scripts/check_monthly.py --date 2026-09-04 --dry-run  # ローカルで�
 ```
 
 GitHub リポジトリの Secrets に `DISCORD_WEBHOOK_URL` を設定すると、GitHub Actions から自動投稿されます。
+
+### Gemini(無料枠)の設定(任意・コスト節約)
+
+1. [Google AI Studio](https://aistudio.google.com/apikey) でAPIキーを発行
+   (課金を有効にしていないプロジェクトの無料枠を使う。上限を超えると課金されず429になる)
+2. リポジトリの Secrets に `GEMINI_API_KEY` を追加
+3. (任意) Variables に `GEMINI_MODEL`(未設定時は `gemini-3.8-flash`)。無料枠が使えない/精度が
+   足りない場合はここでモデルを変える
+
+注意: 無料枠のデータはGoogleの製品改善に使われうるが、扱うのはTDnetで公開済みの開示資料のみ。
+Geminiの判定精度はClaudeと同等とは限らないため、`判定: gemini` の結果は最初のうち目視で確認すること。
 
 ### Claude判定の設定(推奨)
 

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -94,7 +95,7 @@ CLAUDE_TOOL_SCHEMA = {
     },
 }
 
-CLAUDE_PROMPT_TEMPLATE = """あなたは日本の上場企業が開示する「月次売上高」等のIR資料を読み、
+JUDGE_PROMPT_TEMPLATE = """あなたは日本の上場企業が開示する「月次売上高」等のIR資料を読み、
 直近対象月の前年同月比(または増減率)が +30pt/+30% 以上のプラスの項目だけを正確に
 抽出するアシスタントです。
 
@@ -119,7 +120,14 @@ CLAUDE_PROMPT_TEMPLATE = """あなたは日本の上場企業が開示する「�
 企業名: {company_name}
 開示タイトル: {title}
 
-添付のPDFを見て、report_yoy_hits ツールを使って結果を返してください。"""
+添付のPDFを見て、{output_instruction}"""
+
+CLAUDE_OUTPUT_INSTRUCTION = "report_yoy_hits ツールを使って結果を返してください。"
+GEMINI_OUTPUT_INSTRUCTION = (
+    "結果をJSONで返してください。形式は {\"hits\": [{\"item\": 項目名, "
+    "\"reported_value\": 資料の表記そのまま, \"delta_pt\": 変化幅(pt)の数値, "
+    "\"target_month\": 対象月(わかれば)}]} で、該当なしなら {\"hits\": []} としてください。"
+)
 
 
 # $/1Mトークン (入力, 出力)。未掲載モデルはコスト表示を省略しトークン数のみ出す。
@@ -174,7 +182,9 @@ def call_claude_judge(
     フォールバックする)。戻り値は (hits, usage) で usage は {"input_tokens", "output_tokens"}。
     """
     client = anthropic.Anthropic()
-    prompt = CLAUDE_PROMPT_TEMPLATE.format(company_name=company_name, title=title)
+    prompt = JUDGE_PROMPT_TEMPLATE.format(
+        company_name=company_name, title=title, output_instruction=CLAUDE_OUTPUT_INSTRUCTION
+    )
     pdf_b64 = base64.standard_b64encode(pdf_path.read_bytes()).decode("utf-8")
     resp = client.messages.create(
         model=model,
@@ -204,17 +214,144 @@ def call_claude_judge(
     }
     for block in resp.content:
         if block.type == "tool_use" and block.name == "report_yoy_hits":
-            out = []
-            for h in block.input.get("hits", []):
-                delta = float(h["delta_pt"])
-                if delta < THRESHOLD:
-                    continue
-                item = h["item"]
-                if h.get("target_month"):
-                    item = f"{item}({h['target_month']})"
-                out.append({"item": item, "raw_value": h["reported_value"], "delta": delta})
-            return out, usage
+            return _normalize_hits(block.input.get("hits", [])), usage
     return [], usage
+
+
+def _normalize_hits(raw_hits: list[dict]) -> list[dict]:
+    out = []
+    for h in raw_hits:
+        delta = float(h["delta_pt"])
+        if delta < THRESHOLD:
+            continue
+        item = h["item"]
+        if h.get("target_month"):
+            item = f"{item}({h['target_month']})"
+        out.append({"item": item, "raw_value": h["reported_value"], "delta": delta})
+    return out
+
+
+# Gemini による判定(無料枠を優先して使い、上限に達したらClaudeに切り替える)。
+# generateContent は Google 公式ドキュメント上「legacyだが引き続き完全サポート」。
+# SDK(google-genai)はPythonバージョンによって提供APIが異なるため、依存を増やさず
+# requests でRESTを直接叩く。
+GEMINI_MODEL_DEFAULT = "gemini-3.8-flash"
+GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_MAX_RETRY_WAIT_SEC = 90  # 分あたり上限(RPM)で待つ最大秒数。超えるなら日次上限とみなす
+
+GEMINI_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "hits": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "item": {"type": "STRING"},
+                    "reported_value": {"type": "STRING"},
+                    "delta_pt": {"type": "NUMBER"},
+                    "target_month": {"type": "STRING"},
+                },
+                "required": ["item", "reported_value", "delta_pt"],
+            },
+        }
+    },
+    "required": ["hits"],
+}
+
+
+class GeminiQuotaExhausted(Exception):
+    """無料枠の上限に達した(日次上限、または待っても回復しない)。以降Geminiは使わない。"""
+
+
+class GeminiDisabled(Exception):
+    """認証・モデル名などの設定不備。実行中は再試行しても無駄なのでGeminiを無効化する。"""
+
+
+def _gemini_retry_delay_sec(err_body: dict) -> float | None:
+    for d in err_body.get("error", {}).get("details", []):
+        delay = d.get("retryDelay")
+        if isinstance(delay, str) and delay.endswith("s"):
+            try:
+                return float(delay[:-1])
+            except ValueError:
+                return None
+    return None
+
+
+def _gemini_is_daily_quota(err_body: dict) -> bool:
+    text = json.dumps(err_body.get("error", {}), ensure_ascii=False)
+    return "PerDay" in text or "perday" in text.lower()
+
+
+def call_gemini_judge(
+    pdf_path: Path, company_name: str, title: str, model: str, api_key: str
+) -> tuple[list[dict], dict]:
+    """GeminiにPDFを直接渡して判定させる。戻り値は call_claude_judge と同じ (hits, usage)。
+    分あたり上限(429)は待って再試行し、日次上限や待ち時間が長すぎる場合は
+    GeminiQuotaExhausted、認証等の設定不備は GeminiDisabled を送出する。
+    それ以外の失敗は通常の例外(その1件だけClaudeにフォールバックさせる)。
+    """
+    prompt = JUDGE_PROMPT_TEMPLATE.format(
+        company_name=company_name, title=title, output_instruction=GEMINI_OUTPUT_INSTRUCTION
+    )
+    body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": "application/pdf",
+                            "data": base64.standard_b64encode(pdf_path.read_bytes()).decode("utf-8"),
+                        }
+                    },
+                    {"text": prompt},
+                ],
+            }
+        ],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": GEMINI_RESPONSE_SCHEMA,
+            "maxOutputTokens": 8192,
+        },
+    }
+    url = GEMINI_ENDPOINT.format(model=model)
+    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+
+    for attempt in range(3):
+        resp = requests.post(url, headers=headers, json=body, timeout=180)
+        if resp.status_code == 429:
+            try:
+                err = resp.json()
+            except ValueError:
+                err = {}
+            wait = _gemini_retry_delay_sec(err)
+            if _gemini_is_daily_quota(err) or wait is None or wait > GEMINI_MAX_RETRY_WAIT_SEC:
+                raise GeminiQuotaExhausted(resp.text[:300])
+            if attempt == 2:
+                raise GeminiQuotaExhausted(f"429が続くため打ち切り: {resp.text[:200]}")
+            print(f"[INFO] Gemini 429(分あたり上限)。{wait + 1:.0f}秒待って再試行します", file=sys.stderr)
+            time.sleep(wait + 1)
+            continue
+        if resp.status_code in (400, 401, 403, 404):
+            raise GeminiDisabled(f"HTTP {resp.status_code}: {resp.text[:300]}")
+        resp.raise_for_status()
+        data = resp.json()
+        break
+
+    cand = (data.get("candidates") or [{}])[0]
+    if cand.get("finishReason") not in (None, "STOP"):
+        raise RuntimeError(f"Gemini finishReason={cand.get('finishReason')}")
+    text = "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", []))
+    hits = json.loads(text).get("hits", [])
+    um = data.get("usageMetadata", {})
+    usage = {
+        "input_tokens": um.get("promptTokenCount", 0),
+        "output_tokens": um.get("candidatesTokenCount", 0) + um.get("thoughtsTokenCount", 0),
+    }
+    return _normalize_hits(hits), usage
+
 
 ROW_RE = re.compile(
     r'kjCode"\s*noWrap>(?P<code>\d+)</td>\s*'
@@ -551,7 +688,12 @@ def extract_hits_from_text_fallback(pdf_path: Path):
     return hits
 
 
-def process_disclosure(item: dict, tmpdir: Path, claude_ctx: dict | None = None) -> ProcessResult:
+def process_disclosure(
+    item: dict,
+    tmpdir: Path,
+    claude_ctx: dict | None = None,
+    gemini_ctx: dict | None = None,
+) -> ProcessResult:
     result = ProcessResult(
         code=item["code"],
         name=item["name"],
@@ -568,7 +710,43 @@ def process_disclosure(item: dict, tmpdir: Path, claude_ctx: dict | None = None)
         pdf_path.write_bytes(resp.content)
 
         raw_hits = None
-        if claude_ctx and claude_ctx["remaining"] > 0:
+        judged_by = "heuristic"
+
+        # 1. Gemini(無料枠)を最優先
+        if gemini_ctx and not gemini_ctx["disabled"]:
+            try:
+                raw_hits, usage = call_gemini_judge(
+                    pdf_path, item["name"], item["title"], gemini_ctx["model"], gemini_ctx["api_key"]
+                )
+                gemini_ctx["used"] += 1
+                gemini_ctx["consecutive_failures"] = 0
+                gemini_ctx["input_tokens"] += usage["input_tokens"]
+                gemini_ctx["output_tokens"] += usage["output_tokens"]
+                judged_by = "gemini"
+            except (GeminiQuotaExhausted, GeminiDisabled) as e:
+                gemini_ctx["disabled"] = True
+                gemini_ctx["disabled_reason"] = (
+                    "無料枠の上限に達した" if isinstance(e, GeminiQuotaExhausted) else "設定不備"
+                )
+                print(
+                    f"[WARN] Geminiを以降スキップします({gemini_ctx['disabled_reason']}): {e}",
+                    file=sys.stderr,
+                )
+                raw_hits = None
+            except Exception as e:  # noqa: BLE001
+                gemini_ctx["consecutive_failures"] += 1
+                if gemini_ctx["consecutive_failures"] >= 3:
+                    gemini_ctx["disabled"] = True
+                    gemini_ctx["disabled_reason"] = "連続エラー"
+                print(
+                    f"[WARN] Gemini判定に失敗、Claudeにフォールバック "
+                    f"({item['name']}): {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+                raw_hits = None
+
+        # 2. Gemini不可(上限到達・失敗)ならClaude(有料。呼び出し回数の上限つき)
+        if raw_hits is None and claude_ctx and claude_ctx["remaining"] > 0:
             try:
                 raw_hits, usage = call_claude_judge(
                     pdf_path, item["name"], item["title"], claude_ctx["model"]
@@ -576,6 +754,7 @@ def process_disclosure(item: dict, tmpdir: Path, claude_ctx: dict | None = None)
                 claude_ctx["used"] += 1
                 claude_ctx["input_tokens"] += usage["input_tokens"]
                 claude_ctx["output_tokens"] += usage["output_tokens"]
+                judged_by = "claude"
             except Exception as e:  # noqa: BLE001
                 print(
                     f"[WARN] Claude判定に失敗、ヒューリスティックにフォールバック "
@@ -586,6 +765,8 @@ def process_disclosure(item: dict, tmpdir: Path, claude_ctx: dict | None = None)
             finally:
                 claude_ctx["remaining"] -= 1
 
+        # 3. どちらも使えなければ従来のヒューリスティック解析
+        print(f"[INFO]   判定: {judged_by}")
         if raw_hits is None:
             raw_hits = extract_hits_from_tables(pdf_path)
             if not raw_hits:
@@ -641,6 +822,7 @@ def send_discord(
     target_date: datetime.date,
     claude_ctx: dict | None = None,
     jpy_rate: float | None = None,
+    gemini_ctx: dict | None = None,
 ):
     date_str = f"{target_date.month}/{target_date.day}"
     all_hits = [h for r in results for h in r.hits]
@@ -667,12 +849,19 @@ def send_discord(
             f"{date_str}の月次関連開示: {total_disclosures}件(処理: {len(results)}件)",
         ]
 
+    if gemini_ctx and gemini_ctx["used"] > 0:
+        lines.append(
+            f"\n\U0001f193 {date_str}のGemini判定(無料枠): {gemini_ctx['used']}件"
+            f" ({gemini_ctx['model']}) コスト0円"
+        )
+    if gemini_ctx and gemini_ctx["disabled"]:
+        lines.append(f"⚠️ Geminiは途中で停止({gemini_ctx['disabled_reason']})。以降はClaudeで判定")
     if claude_ctx and claude_ctx["used"] > 0:
         cost = estimate_cost_usd(
             claude_ctx["model"], claude_ctx["input_tokens"], claude_ctx["output_tokens"]
         )
         lines.append(
-            f"\n\U0001f4b0 {date_str}のClaude判定コスト: 約{format_cost(cost, jpy_rate)}"
+            f"\U0001f4b0 {date_str}のClaude判定コスト: 約{format_cost(cost, jpy_rate)}"
             f" ({claude_ctx['model']}, {claude_ctx['used']}件判定)"
         )
 
@@ -714,6 +903,23 @@ def main():
         print("pdfplumber がインストールされていません", file=sys.stderr)
         sys.exit(1)
 
+    gemini_ctx = None
+    if os.environ.get("GEMINI_API_KEY"):
+        gemini_model = os.environ.get("GEMINI_MODEL") or GEMINI_MODEL_DEFAULT
+        gemini_ctx = {
+            "api_key": os.environ["GEMINI_API_KEY"],
+            "model": gemini_model,
+            "used": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "consecutive_failures": 0,
+            "disabled": False,
+            "disabled_reason": "",
+        }
+        print(f"[INFO] Gemini判定 有効 (model={gemini_model}, 無料枠を優先。上限到達後はClaudeへ)")
+    else:
+        print("[INFO] GEMINI_API_KEY 未設定のためGeminiは使いません")
+
     claude_ctx = None
     if os.environ.get("ANTHROPIC_API_KEY"):
         if anthropic is None:
@@ -753,7 +959,7 @@ def main():
     results = []
     for item in new_disclosures:
         print(f"[INFO] Processing {item['name']} - {item['title']}")
-        res = process_disclosure(item, tmpdir, claude_ctx)
+        res = process_disclosure(item, tmpdir, claude_ctx, gemini_ctx)
         if res.error:
             print(f"[WARN] {item['name']}: {res.error}", file=sys.stderr)
         results.append(res)
@@ -762,6 +968,12 @@ def main():
     total_hits = sum(len(r.hits) for r in results)
     print(f"[INFO] Total hits: {total_hits}")
     jpy_rate = None
+    if gemini_ctx:
+        print(
+            f"[INFO] Gemini呼び出し回数: {gemini_ctx['used']} (無料枠, コスト0円)"
+            f"{' / 停止: ' + gemini_ctx['disabled_reason'] if gemini_ctx['disabled'] else ''} "
+            f"(input={gemini_ctx['input_tokens']}, output={gemini_ctx['output_tokens']} tokens)"
+        )
     if claude_ctx:
         cost = estimate_cost_usd(
             claude_ctx["model"], claude_ctx["input_tokens"], claude_ctx["output_tokens"]
@@ -778,7 +990,9 @@ def main():
         webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
         if webhook_url:
             # ヒット0件でも「該当なし」+コストを通知する
-            send_discord(webhook_url, results, len(disclosures), target_date, claude_ctx, jpy_rate)
+            send_discord(
+                webhook_url, results, len(disclosures), target_date, claude_ctx, jpy_rate, gemini_ctx
+            )
         else:
             print("[WARN] DISCORD_WEBHOOK_URL not set, skipping notification", file=sys.stderr)
 

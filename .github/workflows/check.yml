@@ -38,6 +38,8 @@ jobs:
       - name: Run check
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MAX_CLAUDE_CALLS_PER_RUN: ${{ vars.MAX_CLAUDE_CALLS_PER_RUN }}
           ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
