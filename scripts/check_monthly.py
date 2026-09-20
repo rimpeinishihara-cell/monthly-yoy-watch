@@ -336,7 +336,7 @@ def call_gemini_judge(
                 err = {}
             wait = _gemini_retry_delay_sec(err)
             if _gemini_is_daily_quota(err) or wait is None or wait > GEMINI_MAX_RETRY_WAIT_SEC:
-                raise GeminiQuotaExhausted(resp.text[:300])
+                raise GeminiQuotaExhausted(resp.text[:800])
             if attempt == 2:
                 raise GeminiQuotaExhausted(f"429が続くため打ち切り: {resp.text[:200]}")
             print(f"[INFO] Gemini 429(分あたり上限)。{wait + 1:.0f}秒待って再試行します", file=sys.stderr)
@@ -729,6 +729,7 @@ def judge_with_gemini(pdf_path: Path, item: dict, ctx: dict) -> list[dict] | Non
         if ctx["last_call"] and wait > 0:
             time.sleep(wait)
         ctx["last_call"] = time.monotonic()
+        ctx["last_model"] = m["name"]
         try:
             hits, usage = call_gemini_judge(
                 pdf_path, item["name"], item["title"], m["name"], ctx["api_key"]
@@ -789,7 +790,7 @@ def process_disclosure(
         if gemini_ctx and not gemini_ctx["disabled"]:
             raw_hits = judge_with_gemini(pdf_path, item, gemini_ctx)
             if raw_hits is not None:
-                judged_by = "gemini"
+                judged_by = f"gemini({gemini_ctx['last_model']})"
 
         # 2. Gemini不可(上限到達・失敗)ならClaude(有料。呼び出し回数の上限つき)
         if raw_hits is None and claude_ctx and claude_ctx["remaining"] > 0:
