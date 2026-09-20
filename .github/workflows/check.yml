@@ -14,6 +14,15 @@ on:
         required: false
         type: boolean
         default: false
+      backtest:
+        description: "バックテスト(処理済みも再判定。Discord送信・状態保存なし)"
+        required: false
+        type: boolean
+        default: false
+      judge_only:
+        description: "判定エンジンを限定 (gemini / claude。空なら通常どおり)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -40,6 +49,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          JUDGE_ONLY: ${{ github.event.inputs.judge_only }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MAX_CLAUDE_CALLS_PER_RUN: ${{ vars.MAX_CLAUDE_CALLS_PER_RUN }}
           ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
@@ -50,6 +60,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
+          fi
+          if [ "${{ github.event.inputs.backtest }}" = "true" ]; then
+            ARGS="$ARGS --backtest"
           fi
           python scripts/check_monthly.py $ARGS
 

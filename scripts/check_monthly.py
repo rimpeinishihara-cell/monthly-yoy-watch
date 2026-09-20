@@ -939,7 +939,15 @@ def main():
         default=None,
     )
     parser.add_argument("--dry-run", action="store_true", help="Discord送信をスキップ")
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help="処理済みでも再判定し、Discord送信・状態保存をしない(判定結果の比較用)。"
+        "環境変数 JUDGE_ONLY=gemini|claude で判定エンジンを片方に限定できる",
+    )
     args = parser.parse_args()
+    if args.backtest:
+        args.dry_run = True
 
     if args.date:
         target_date = datetime.date.fromisoformat(args.date)
@@ -986,13 +994,23 @@ def main():
     else:
         print("[INFO] ANTHROPIC_API_KEY 未設定のため、ヒューリスティック解析のみで実行します")
 
+    judge_only = (os.environ.get("JUDGE_ONLY") or "").lower()
+    if judge_only == "gemini":
+        claude_ctx = None
+    elif judge_only == "claude":
+        gemini_ctx = None
+    if judge_only:
+        print(f"[INFO] JUDGE_ONLY={judge_only}: 判定エンジンを限定します")
+
     print(f"[INFO] Checking TDnet disclosures for {target_date}")
     html = fetch_tdnet_list(target_date)
     disclosures = list(parse_monthly_disclosures(html))
     print(f"[INFO] Found {len(disclosures)} monthly disclosure(s)")
 
     state = load_state()
-    new_disclosures = [d for d in disclosures if d["doc_id"] not in state]
+    new_disclosures = (
+        disclosures if args.backtest else [d for d in disclosures if d["doc_id"] not in state]
+    )
     print(f"[INFO] {len(new_disclosures)} not yet processed")
 
     tmpdir = Path("tmp_pdfs")
@@ -1038,7 +1056,8 @@ def main():
         else:
             print("[WARN] DISCORD_WEBHOOK_URL not set, skipping notification", file=sys.stderr)
 
-    save_state(state)
+    if not args.backtest:
+        save_state(state)
 
 
 if __name__ == "__main__":
