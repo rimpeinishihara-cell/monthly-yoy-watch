@@ -65,11 +65,18 @@ GitHub リポジトリの Secrets に `DISCORD_WEBHOOK_URL` を設定すると�
 1. [Google AI Studio](https://aistudio.google.com/apikey) でAPIキーを発行
    (課金を有効にしていないプロジェクトの無料枠を使う。上限を超えると課金されず429になる)
 2. リポジトリの Secrets に `GEMINI_API_KEY` を追加
-3. (任意) Variables に `GEMINI_MODEL`(未設定時は `gemini-3.8-flash`)。無料枠が使えない/精度が
-   足りない場合はここでモデルを変える
+3. (任意) Variables:
+   - `GEMINI_MODEL`: 優先順のカンマ区切り。未設定時は `gemini-3.8-flash,gemini-3.7-flash`。
+     無料枠はモデルごとに別枠で、2026-09時点の当プロジェクトでは 3.5〜3.8 Flash が
+     5RPM/20RPD、Flash-Lite系が 15RPM/500RPD(軽量で精度に不安)、Pro系は無料枠なし。
+     最新の値は AI Studio の「レート制限」画面で確認できる
+   - `GEMINI_RPM`: 1分あたりの上限に合わせた呼び出し間隔の調整(未設定時は5)
+
+先頭のモデルの1日上限に達したら次のモデル、全モデルが尽きたらClaudeに切り替わる。
 
 注意: 無料枠のデータはGoogleの製品改善に使われうるが、扱うのはTDnetで公開済みの開示資料のみ。
-Geminiの判定精度はClaudeと同等とは限らないため、`判定: gemini` の結果は最初のうち目視で確認すること。
+Geminiの判定精度はClaudeと同等とは限らない(軽量モデルでは実際に見逃しが出た)ため、
+`判定: gemini` の結果は最初のうち目視で確認すること。
 
 ### Claude判定の設定(推奨)
 

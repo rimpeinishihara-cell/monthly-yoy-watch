@@ -235,7 +235,11 @@ def _normalize_hits(raw_hits: list[dict]) -> list[dict]:
 # generateContent は Google 公式ドキュメント上「legacyだが引き続き完全サポート」。
 # SDK(google-genai)はPythonバージョンによって提供APIが異なるため、依存を増やさず
 # requests でRESTを直接叩く。
-GEMINI_MODEL_DEFAULT = "gemini-3.8-flash"
+# 無料枠(2026-09時点の当プロジェクトのレート制限): 3.5〜3.8 Flash は各 5RPM/20RPD、
+# Flash-Lite系は 15RPM/500RPD だが軽量で精度が不安(Claude Haikuで見逃しが出た実績)
+# のため既定は精度の高いFlashを2モデル(=1日最大40件)。カンマ区切りで優先順に指定できる。
+GEMINI_MODEL_DEFAULT = "gemini-3.8-flash,gemini-3.7-flash"
+GEMINI_RPM_DEFAULT = 5
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GEMINI_MAX_RETRY_WAIT_SEC = 90  # 分あたり上限(RPM)で待つ最大秒数。超えるなら日次上限とみなす
 
@@ -688,6 +692,66 @@ def extract_hits_from_text_fallback(pdf_path: Path):
     return hits
 
 
+def make_gemini_ctx(api_key: str, models_csv: str, rpm: int) -> dict:
+    """models_csv は優先順のカンマ区切り。無料枠はモデルごとに別枠なので、1つが上限に
+    達したら次のモデルへ進み、全部尽きたらGemini自体を止めてClaudeへ切り替える。"""
+    models = [m.strip() for m in models_csv.split(",") if m.strip()]
+    return {
+        "api_key": api_key,
+        "models": [{"name": m, "disabled": False, "used": 0} for m in models],
+        "used": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "consecutive_failures": 0,
+        "disabled": False,
+        "disabled_reason": "",
+        "min_interval": 60.0 / max(rpm, 1) + 1.0,  # 分あたり上限(RPM)を超えない呼び出し間隔
+        "last_call": 0.0,
+    }
+
+
+def judge_with_gemini(pdf_path: Path, item: dict, ctx: dict) -> list[dict] | None:
+    """使えるGeminiモデルを優先順に試す。判定できたらhits、Gemini全体が使えない/この1件が
+    失敗したらNone(呼び出し側がClaudeへ)。無料枠が尽きたモデルは以降スキップする。"""
+    for m in ctx["models"]:
+        if m["disabled"]:
+            continue
+        wait = ctx["min_interval"] - (time.monotonic() - ctx["last_call"])
+        if ctx["last_call"] and wait > 0:
+            time.sleep(wait)
+        ctx["last_call"] = time.monotonic()
+        try:
+            hits, usage = call_gemini_judge(
+                pdf_path, item["name"], item["title"], m["name"], ctx["api_key"]
+            )
+        except (GeminiQuotaExhausted, GeminiDisabled) as e:
+            m["disabled"] = True
+            ctx["disabled_reason"] = (
+                "無料枠の上限に達した" if isinstance(e, GeminiQuotaExhausted) else "設定不備"
+            )
+            print(f"[WARN] Gemini {m['name']} を以降スキップ({ctx['disabled_reason']}): {e}", file=sys.stderr)
+            continue
+        except Exception as e:  # noqa: BLE001
+            ctx["consecutive_failures"] += 1
+            if ctx["consecutive_failures"] >= 3:
+                ctx["disabled"] = True
+                ctx["disabled_reason"] = "連続エラー"
+            print(
+                f"[WARN] Gemini判定に失敗、Claudeにフォールバック ({item['name']}): "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            return None
+        ctx["used"] += 1
+        m["used"] += 1
+        ctx["consecutive_failures"] = 0
+        ctx["input_tokens"] += usage["input_tokens"]
+        ctx["output_tokens"] += usage["output_tokens"]
+        return hits
+    ctx["disabled"] = True
+    return None
+
+
 def process_disclosure(
     item: dict,
     tmpdir: Path,
@@ -714,36 +778,9 @@ def process_disclosure(
 
         # 1. Gemini(無料枠)を最優先
         if gemini_ctx and not gemini_ctx["disabled"]:
-            try:
-                raw_hits, usage = call_gemini_judge(
-                    pdf_path, item["name"], item["title"], gemini_ctx["model"], gemini_ctx["api_key"]
-                )
-                gemini_ctx["used"] += 1
-                gemini_ctx["consecutive_failures"] = 0
-                gemini_ctx["input_tokens"] += usage["input_tokens"]
-                gemini_ctx["output_tokens"] += usage["output_tokens"]
+            raw_hits = judge_with_gemini(pdf_path, item, gemini_ctx)
+            if raw_hits is not None:
                 judged_by = "gemini"
-            except (GeminiQuotaExhausted, GeminiDisabled) as e:
-                gemini_ctx["disabled"] = True
-                gemini_ctx["disabled_reason"] = (
-                    "無料枠の上限に達した" if isinstance(e, GeminiQuotaExhausted) else "設定不備"
-                )
-                print(
-                    f"[WARN] Geminiを以降スキップします({gemini_ctx['disabled_reason']}): {e}",
-                    file=sys.stderr,
-                )
-                raw_hits = None
-            except Exception as e:  # noqa: BLE001
-                gemini_ctx["consecutive_failures"] += 1
-                if gemini_ctx["consecutive_failures"] >= 3:
-                    gemini_ctx["disabled"] = True
-                    gemini_ctx["disabled_reason"] = "連続エラー"
-                print(
-                    f"[WARN] Gemini判定に失敗、Claudeにフォールバック "
-                    f"({item['name']}): {type(e).__name__}: {e}",
-                    file=sys.stderr,
-                )
-                raw_hits = None
 
         # 2. Gemini不可(上限到達・失敗)ならClaude(有料。呼び出し回数の上限つき)
         if raw_hits is None and claude_ctx and claude_ctx["remaining"] > 0:
@@ -850,9 +887,9 @@ def send_discord(
         ]
 
     if gemini_ctx and gemini_ctx["used"] > 0:
+        per_model = ", ".join(f"{m['name']} {m['used']}件" for m in gemini_ctx["models"] if m["used"])
         lines.append(
-            f"\n\U0001f193 {date_str}のGemini判定(無料枠): {gemini_ctx['used']}件"
-            f" ({gemini_ctx['model']}) コスト0円"
+            f"\n\U0001f193 {date_str}のGemini判定(無料枠): {gemini_ctx['used']}件 コスト0円 ({per_model})"
         )
     if gemini_ctx and gemini_ctx["disabled"]:
         lines.append(f"⚠️ Geminiは途中で停止({gemini_ctx['disabled_reason']})。以降はClaudeで判定")
@@ -905,18 +942,13 @@ def main():
 
     gemini_ctx = None
     if os.environ.get("GEMINI_API_KEY"):
-        gemini_model = os.environ.get("GEMINI_MODEL") or GEMINI_MODEL_DEFAULT
-        gemini_ctx = {
-            "api_key": os.environ["GEMINI_API_KEY"],
-            "model": gemini_model,
-            "used": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "consecutive_failures": 0,
-            "disabled": False,
-            "disabled_reason": "",
-        }
-        print(f"[INFO] Gemini判定 有効 (model={gemini_model}, 無料枠を優先。上限到達後はClaudeへ)")
+        gemini_models = os.environ.get("GEMINI_MODEL") or GEMINI_MODEL_DEFAULT
+        gemini_rpm = int(os.environ.get("GEMINI_RPM") or GEMINI_RPM_DEFAULT)
+        gemini_ctx = make_gemini_ctx(os.environ["GEMINI_API_KEY"], gemini_models, gemini_rpm)
+        print(
+            f"[INFO] Gemini判定 有効 (models={gemini_models}, RPM想定={gemini_rpm}, "
+            f"無料枠を優先。全モデルの上限到達後はClaudeへ)"
+        )
     else:
         print("[INFO] GEMINI_API_KEY 未設定のためGeminiは使いません")
 
