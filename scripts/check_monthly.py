@@ -218,7 +218,11 @@ def call_claude_judge(
     return [], usage
 
 
-def _normalize_hits(raw_hits: list[dict]) -> list[dict]:
+def _normalize_hits(raw_hits: list[dict] | str) -> list[dict]:
+    # モデルがhits配列やその要素をJSON文字列で返すことがあるため、文字列なら解釈し直す
+    if isinstance(raw_hits, str):
+        raw_hits = json.loads(raw_hits)
+    raw_hits = [json.loads(h) if isinstance(h, str) else h for h in raw_hits]
     out = []
     for h in raw_hits:
         delta = float(h["delta_pt"])
@@ -337,6 +341,11 @@ def call_gemini_judge(
                 raise GeminiQuotaExhausted(f"429が続くため打ち切り: {resp.text[:200]}")
             print(f"[INFO] Gemini 429(分あたり上限)。{wait + 1:.0f}秒待って再試行します", file=sys.stderr)
             time.sleep(wait + 1)
+            continue
+        if resp.status_code in (500, 502, 503, 504) and attempt < 2:
+            # 混雑・一時障害。待って再試行する(新しいモデルの無料枠で起きやすい)
+            print(f"[INFO] Gemini HTTP {resp.status_code}。{5 * (attempt + 1) * 2}秒待って再試行", file=sys.stderr)
+            time.sleep(5 * (attempt + 1) * 2)
             continue
         if resp.status_code in (400, 401, 403, 404):
             raise GeminiDisabled(f"HTTP {resp.status_code}: {resp.text[:300]}")
@@ -831,6 +840,7 @@ def process_disclosure(
                     pdf_url=item["pdf_url"],
                 )
             )
+            print(f"[INFO]   ヒット: {h['item']} {h['raw_value']} ({h['delta']:+.1f}pt)")
     except Exception as e:  # noqa: BLE001
         result.error = f"{type(e).__name__}: {e}"
     return result
